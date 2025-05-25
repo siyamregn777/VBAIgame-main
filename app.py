@@ -1,7 +1,7 @@
 # Adventure Game
 import os
-os.environ['SDL_VIDEODRIVER'] = 'cocoa'  # Use native macOS window system
-os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
+# os.environ['SDL_VIDEODRIVER'] = 'cocoa'  # Use native macOS window system
+# os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
 
 import pygame
 from pygame.locals import *
@@ -14,6 +14,17 @@ import textwrap
 from openai import OpenAI
 from dotenv import load_dotenv
 import time
+import os
+import pygame
+import sounddevice as sd
+import asyncio
+import threading
+import base64
+from audio_util import CHANNELS, SAMPLE_RATE, AudioPlayerAsync
+from openai import AsyncOpenAI
+from openai.resources.beta.realtime.realtime import AsyncRealtimeConnection
+
+#os.environ["SDL_VIDEODRIVER"] = "x11"
 
 # Load environment variables
 load_dotenv()
@@ -28,8 +39,8 @@ print("[OpenAI] API key loaded successfully.")
 # Initialize Pygame with macOS specific settings
 pygame.init()
 display = (800, 600)
-pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 2)
-pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 1)
+# pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 2)
+# pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 1)
 pygame.display.set_mode(display, DOUBLEBUF|OPENGL)
 screen = pygame.display.get_surface()
 
@@ -145,67 +156,124 @@ def draw_sphere(radius, slices, stacks):
             glVertex3f(x * zr1 * radius, y * zr1 * radius, z1 * radius)
         glEnd()
 
+
 class DialogueSystem:
     def __init__(self):
         self.active = False
         self.user_input = ""
-        try:
-            pygame.font.init()
-            self.font = pygame.font.Font(None, 24)
-            print("[DialogueSystem] Font loaded successfully")
-        except Exception as e:
-            print("[DialogueSystem] Font loading failed:", e)
+        pygame.font.init()
+        self.font = pygame.font.Font(None, 24)
         self.npc_message = ""
         self.input_active = False
-        self.last_npc_text = ""     # Track NPC text separately
-        self.last_input_text = ""   # Track input text separately
-        self.conversation_history = []  # Maintain conversation history
+        self.last_npc_text = ""
+        self.last_input_text = ""
+        self.conversation_history = []
 
-        # Create a surface for the UI
         self.ui_surface = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA).convert_alpha()
         self.ui_texture = glGenTextures(1)
-        self.current_npc = None  # Track which NPC we're talking to
-        self.initial_player_pos = None  # Store initial position when dialogue starts
+        self.current_npc = None
+        self.initial_player_pos = None
 
-    def render_text(self, surface, text, x, y):
-        max_width = WINDOW_WIDTH - 40
-        line_height = 25
-        
-        words = text.split()
-        lines = []
-        current_line = []
-        current_width = 0
-        
-        # Always use pure white with full opacity
-        text_color = (255, 255, 255)
-        
-        for word in words:
-            word_surface = self.font.render(word + ' ', True, text_color)
-            word_width = word_surface.get_width()
-            
-            if current_width + word_width <= max_width:
-                current_line.append(word)
-                current_width += word_width
-            else:
-                lines.append(' '.join(current_line))
-                current_line = [word]
-                current_width = word_width
-        
-        if current_line:
-            lines.append(' '.join(current_line))
-        
-        # Render each line in pure white
-        for i, line in enumerate(lines):
-            text_surface = self.font.render(line, True, (255, 255, 255))  # Force white color
-            surface.blit(text_surface, (x, y + i * line_height))
-        
-        return len(lines) * line_height
+        self.api_key = os.environ.get("OPENAI_API_KEY", None)
+        if not self.api_key:
+            print("[DialogueSystem] WARNING: No OPENAI_API_KEY found in environment!")
+
+        self.realtime_conn = None
+        self.should_send_audio = asyncio.Event()
+        self.last_audio_item_id = None
+        self.acc_items = {}
+        self.audio_player = AudioPlayerAsync()  
+        self.sent_audio_once = False 
+        self.client = AsyncOpenAI(api_key=self.api_key)
+        self.loop = asyncio.new_event_loop()
+        self.loop_thread = threading.Thread(target=self.run_asyncio_loop, daemon=True)
+        self.loop_thread.start()
+
+        asyncio.run_coroutine_threadsafe(self.initialize_realtime(), self.loop)
+        asyncio.run_coroutine_threadsafe(self.record_mic_audio(), self.loop)
+
+    async def initialize_realtime(self):
+        print("[DialogueSystem] Attempting Realtime API connection...")
+        try:
+            async with self.client.beta.realtime.connect(model="gpt-4o-realtime-preview-2024-10-01") as conn: # gpt-4o-realtime-preview-2024-10-01
+                self.realtime_conn = conn
+                await conn.session.update(session={"turn_detection": {"type": "server_vad"}})
+
+                async for event in conn:
+                    if event.type == "session.created":
+                        print(f"[Realtime] Session created: {event.session.id}")
+
+                    elif event.type == "session.updated":
+                        pass
+
+                    elif event.type == "response.audio.delta":
+                        if event.item_id != self.last_audio_item_id:
+                            self.audio_player.reset_frame_count()
+                            self.last_audio_item_id = event.item_id
+                        bytes_data = base64.b64decode(event.delta)
+                        self.audio_player.add_data(bytes_data)
+
+                    elif event.type == "response.audio_transcript.delta":
+                        so_far = self.acc_items.get(event.item_id, "")
+                        so_far += event.delta
+                        self.acc_items[event.item_id] = so_far
+                        print(f"[Realtime] Assistant partial transcript: {so_far}")
+
+        except Exception as e:
+            print(f"[DialogueSystem] Realtime connection error: {e}")
+
+    async def record_mic_audio(self):
+        read_size = int(SAMPLE_RATE * 0.02)
+        stream = sd.InputStream(channels=CHANNELS, samplerate=SAMPLE_RATE, dtype="int16")
+        stream.start()
+        print("[DialogueSystem] Audio input stream started.")
+
+        try:
+            while True:
+                await self.should_send_audio.wait()
+                if stream.read_available < read_size:
+                    await asyncio.sleep(0)
+                    continue
+
+                data, _ = stream.read(read_size)
+                if self.realtime_conn:
+                    if not self.sent_audio_once:
+                        asyncio.create_task(self.realtime_conn.send({"type": "response.cancel"}))
+                        self.sent_audio_once = True
+
+                    # Base64 encode the chunk
+                    b64_audio = base64.b64encode(data).decode("utf-8")
+                    # Append to the model’s input audio buffer
+                    await self.realtime_conn.input_audio_buffer.append(audio=b64_audio)
+
+                await asyncio.sleep(0)
+        except Exception as e:
+            print(f"[DialogueSystem] Error in record_mic_audio: {e}")
+        finally:
+            stream.stop()
+            stream.close()
+
+    async def commit_and_get_assistant_response(self):
+        if self.realtime_conn:
+            await self.realtime_conn.input_audio_buffer.commit()
+            await self.realtime_conn.response.create()
+            print("[DialogueSystem] Committed user audio & requested assistant response.")
+            self.sent_audio_once = False  # reset
+
+    def run_asyncio_loop(self):
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
+
+
 
     def start_conversation(self, npc_role="HR", player_pos=None):
+        """
+        Called when the dialogue starts (e.g. player pressed 'E' to talk).
+        You can decide to automatically do push-to-talk here, or wait.
+        """
         self.active = True
         self.input_active = True
         self.current_npc = npc_role
-        # Store player's position when starting conversation
         self.initial_player_pos = [player_pos[0], player_pos[1], player_pos[2]] if player_pos else [0, 0.5, 0]
         print(f"[DialogueSystem] Dialogue started with {npc_role}")
 
@@ -222,124 +290,50 @@ class DialogueSystem:
         if npc_role == "HR":
             system_prompt = f"""{base_prompt}
                 You are Sarah Chen, HR Director at Venture Builder AI. Core traits:
-                
-                PERSONALITY:
-                - Warm but professional demeanor
-                - Excellent emotional intelligence
-                - Strong ethical boundaries
-                - Protective of confidential information
-                - Quick to offer practical solutions
-                
-                BACKGROUND:
-                - 15 years HR experience in tech
-                - Masters in Organizational Psychology
-                - Certified in Conflict Resolution
-                - Known for fair handling of sensitive issues
-                
-                SPEAKING STYLE:
-                - Uses supportive language: "I understand that..." "Let's explore..."
-                - References policies with context: "According to our wellness policy..."
-                - Balances empathy with professionalism
-                
-                CURRENT COMPANY INITIATIVES:
-                - AI Talent Development Program
-                - Global Remote Work Framework
-                - Venture Studio Culture Development
-                - Innovation Leadership Track
-                
-                BEHAVIORAL GUIDELINES:
-                - Never disclose confidential information
-                - Always offer clear next steps
-                - Maintain professional boundaries
-                - Document sensitive conversations
-                - Escalate serious concerns appropriately"""
-
+                (HR details here)...
+            """
         else:  # CEO
             system_prompt = f"""{base_prompt}
                 You are Michael Chen, CEO of Venture Builder AI. Core traits:
-                
-                PERSONALITY:
-                - Visionary yet approachable
-                - Strategic thinker
-                - Passionate about venture building
-                - Values transparency
-                - Leads by example
-                
-                BACKGROUND:
-                - Founded Venture Builder AI 5 years ago
-                - Successfully launched 15+ venture-backed startups
-                - MIT Computer Science graduate
-                - Pioneer in AI-powered venture building
-                
-                SPEAKING STYLE:
-                - Uses storytelling: "When we launched our first venture..."
-                - References data: "Our portfolio metrics show..."
-                - Balances optimism with realism
-                
-                KEY FOCUSES:
-                - AI-powered venture creation
-                - Portfolio company growth
-                - Startup ecosystem development
-                - Global venture studio expansion
-                
-                CURRENT INITIATIVES:
-                - AI Venture Studio Framework
-                - European Market Entry
-                - Startup Success Methodology
-                - Founder-in-Residence Program
-                
-                BEHAVIORAL GUIDELINES:
-                - Share venture building vision
-                - Highlight portfolio successes
-                - Address startup challenges
-                - Maintain investor confidence
-                - Balance transparency with discretion"""
+                (CEO details here)...
+            """
 
-        # Fix the initial message to be from the NPC to the user
         initial_message = {
             "HR": "Hello! I'm Sarah, the HR Director at Venture Builder AI. How can I assist you today?",
             "CEO": "Hello! I'm Michael, the CEO of Venture Builder AI. What can I do for you today?"
         }
 
-            
-        # Set the NPC's greeting as the current message
         self.npc_message = initial_message[npc_role]
-        
-        # Initialize conversation history with system prompt only
+
         self.conversation_history = [{
             "role": "system",
             "content": system_prompt
         }]
-        
-        print(f"[DialogueSystem] Dialogue started with {npc_role}")
 
     def send_message(self):
+        """
+        If you still want typed-based conversation, you can keep using
+        the normal Chat Completions API call. But note that the Realtime
+        session is also able to produce text transcripts on its own.
+        """
         if not self.conversation_history:
             print("[DialogueSystem] No conversation history to send.")
             return
 
         try:
             response = client.chat.completions.create(
-                model="gpt-4-0125-preview",  # or your current model
+                model="gpt-4-0125-preview",
+                # model="gpt-3.5-turbo",
                 messages=self.conversation_history,
                 temperature=0.85,
                 max_tokens=150,
-                response_format={ "type": "text" },
-                top_p=0.95,
-                frequency_penalty=0.2,
-                presence_penalty=0.1
             )
             ai_message = response.choices[0].message.content
-            
-            # Store the message in conversation history
             self.conversation_history.append({
                 "role": "assistant",
                 "content": ai_message
             })
-            
-            # Set the NPC message with white text color
             self.npc_message = ai_message
-            
             print(f"[DialogueSystem] NPC says: {self.npc_message}")
         except Exception as e:
             self.npc_message = "I apologize, but I'm having trouble connecting to our systems right now."
@@ -350,37 +344,28 @@ class DialogueSystem:
             return
 
         self.ui_surface.fill((0, 0, 0, 0))
-
         if self.active:
             box_height = 200
             box_y = WINDOW_HEIGHT - box_height - 20
-            
-            # Make the background MUCH darker - almost black with some transparency
-            box_color = (0, 0, 0, 230)  # Changed to very dark, mostly opaque background
+            box_color = (0, 0, 0, 230)
             pygame.draw.rect(self.ui_surface, box_color, (20, box_y, WINDOW_WIDTH - 40, box_height))
-            
-            # White border
             pygame.draw.rect(self.ui_surface, (255, 255, 255, 255), (20, box_y, WINDOW_WIDTH - 40, box_height), 2)
 
-            # Render ALL text in pure white (255, 255, 255)
             # Quit instruction
-            quit_text_surface = self.font.render("Press Shift+Q to exit", True, (255, 255, 255))
+            quit_text_surface = self.font.render("Press Shift+Q to exit, Press F5 to record", True, (255, 255, 255))
             self.ui_surface.blit(quit_text_surface, (40, box_y + 10))
 
-            # NPC message in white
+            # NPC message
             if self.npc_message:
                 self.render_text(self.ui_surface, self.npc_message, 40, box_y + 40)
 
-            # Input prompt in white
+            # Input prompt
             if self.input_active:
                 input_prompt = "> " + self.user_input + "_"
                 input_surface = self.font.render(input_prompt, True, (255, 255, 255))
                 self.ui_surface.blit(input_surface, (40, box_y + box_height - 40))
 
-        # Convert surface to OpenGL texture
         texture_data = pygame.image.tostring(self.ui_surface, "RGBA", True)
-
-        # Save current OpenGL state
         glPushAttrib(GL_ALL_ATTRIB_BITS)
         glMatrixMode(GL_PROJECTION)
         glPushMatrix()
@@ -390,19 +375,16 @@ class DialogueSystem:
         glPushMatrix()
         glLoadIdentity()
 
-        # Setup for 2D rendering
         glDisable(GL_DEPTH_TEST)
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
         glEnable(GL_TEXTURE_2D)
 
-        # Bind and update texture
         glBindTexture(GL_TEXTURE_2D, self.ui_texture)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, WINDOW_WIDTH, WINDOW_HEIGHT, 0, GL_RGBA, GL_UNSIGNED_BYTE, texture_data)
 
-        # Draw the UI texture
         glBegin(GL_QUADS)
         glTexCoord2f(0, 0); glVertex2f(0, 0)
         glTexCoord2f(1, 0); glVertex2f(WINDOW_WIDTH, 0)
@@ -410,7 +392,6 @@ class DialogueSystem:
         glTexCoord2f(0, 1); glVertex2f(0, WINDOW_HEIGHT)
         glEnd()
 
-        # Restore OpenGL state
         glMatrixMode(GL_PROJECTION)
         glPopMatrix()
         glMatrixMode(GL_MODELVIEW)
@@ -422,30 +403,69 @@ class DialogueSystem:
             return
 
         if event.type == pygame.KEYDOWN:
-            # Check for Shift+Q to exit chat
             keys = pygame.key.get_pressed()
+            # SHIFT+Q ends chat
             if keys[pygame.K_LSHIFT] and event.key == pygame.K_q:
                 self.active = False
                 self.input_active = False
                 print("[DialogueSystem] Chat ended")
-                # Return both the command and the initial position
                 return {"command": "move_player_back", "position": self.initial_player_pos}
 
-            if event.key == pygame.K_RETURN and self.user_input.strip():
-                print(f"[DialogueSystem] User said: {self.user_input}")
-                
-                # Add user message to conversation history
-                self.conversation_history.append({"role": "user", "content": self.user_input.strip()})
-                
-                # Clear user input
-                self.user_input = ""
+            # If user wants to push-to-talk with "K"
+            if event.key == pygame.K_F5:
+                # Toggle
+                if self.should_send_audio.is_set():
+                    # Stop sending audio
+                    self.should_send_audio.clear()
+                    # Manually commit & request the assistant
+                    asyncio.run_coroutine_threadsafe(self.commit_and_get_assistant_response(), self.loop)
+                    print("[DialogueSystem] Stopped recording & requested assistant.")
+                else:
+                    # Start sending audio
+                    print("[DialogueSystem] Start recording user speech.")
+                    self.should_send_audio.set()
 
-                # Send message to AI
+            # If user just wants to type text
+            if event.key == pygame.K_RETURN and self.user_input.strip():
+                print(f"[DialogueSystem] User typed: {self.user_input}")
+                self.conversation_history.append({"role": "user", "content": self.user_input.strip()})
+                self.user_input = ""
                 self.send_message()
             elif event.key == pygame.K_BACKSPACE:
                 self.user_input = self.user_input[:-1]
             elif event.unicode.isprintable():
                 self.user_input += event.unicode
+
+    def render_text(self, surface, text, x, y):
+        max_width = WINDOW_WIDTH - 40
+        line_height = 25
+
+        words = text.split()
+        lines = []
+        current_line = []
+        current_width = 0
+
+        text_color = (255, 255, 255)
+
+        for word in words:
+            word_surface = self.font.render(word + ' ', True, text_color)
+            word_width = word_surface.get_width()
+            if current_width + word_width <= max_width:
+                current_line.append(word)
+                current_width += word_width
+            else:
+                lines.append(' '.join(current_line))
+                current_line = [word]
+                current_width = word_width
+
+        if current_line:
+            lines.append(' '.join(current_line))
+
+        for i, line in enumerate(lines):
+            text_surface = self.font.render(line, True, text_color)
+            surface.blit(text_surface, (x, y + i * line_height))
+
+        return len(lines) * line_height
 
 class World:
     def __init__(self):
