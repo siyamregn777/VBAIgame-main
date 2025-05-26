@@ -1,7 +1,7 @@
 # Adventure Game
 import os
-# os.environ['SDL_VIDEODRIVER'] = 'cocoa'  # Use native macOS window system
-# os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
+#os.environ['SDL_VIDEODRIVER'] = 'cocoa'  # Use native macOS window system
+os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
 
 import pygame
 from pygame.locals import *
@@ -20,7 +20,7 @@ import sounddevice as sd
 import asyncio
 import threading
 import base64
-from audio_util import CHANNELS, SAMPLE_RATE, AudioPlayerAsync
+from audio import CHANNELS, SAMPLE_RATE, AudioPlayerAsync
 from openai import AsyncOpenAI
 from openai.resources.beta.realtime.realtime import AsyncRealtimeConnection
 
@@ -185,6 +185,27 @@ class DialogueSystem:
         self.audio_player = AudioPlayerAsync()  
         self.sent_audio_once = False 
         self.client = AsyncOpenAI(api_key=self.api_key)
+        
+        # Define voice settings for each NPC
+        self.voice_settings = {
+            "HR": {
+                "voice": "nova",  # Female voice
+                "system_prompt": """You are Sarah Chen, HR Director at Venture Builder AI. Core traits:
+                    - Warm and approachable
+                    - Professional but friendly
+                    - Uses phrases like "How can I help?" and "Let me check on that"
+                    - Speaks clearly and supportively"""
+            },
+            "CEO": {
+                "voice": "echo",  # Male voice
+                "system_prompt": """You are Michael Chen, CEO of Venture Builder AI. Core traits:
+                    - Confident and direct
+                    - Visionary thinker
+                    - Uses business terminology
+                    - Speaks concisely with authority"""
+            }
+        }
+        
         self.loop = asyncio.new_event_loop()
         self.loop_thread = threading.Thread(target=self.run_asyncio_loop, daemon=True)
         self.loop_thread.start()
@@ -195,7 +216,10 @@ class DialogueSystem:
     async def initialize_realtime(self):
         print("[DialogueSystem] Attempting Realtime API connection...")
         try:
-            async with self.client.beta.realtime.connect(model="gpt-4o-realtime-preview-2024-10-01") as conn: # gpt-4o-realtime-preview-2024-10-01
+            async with self.client.beta.realtime.connect(
+                model="gpt-4o-realtime-preview-2024-10-01",
+                timeout=30  # Increased timeout
+            ) as conn:
                 self.realtime_conn = conn
                 await conn.session.update(session={"turn_detection": {"type": "server_vad"}})
 
@@ -219,6 +243,8 @@ class DialogueSystem:
                         self.acc_items[event.item_id] = so_far
                         print(f"[Realtime] Assistant partial transcript: {so_far}")
 
+        except asyncio.TimeoutError:
+            print("[DialogueSystem] Connection timed out - check your network or API access")
         except Exception as e:
             print(f"[DialogueSystem] Realtime connection error: {e}")
 
@@ -243,7 +269,7 @@ class DialogueSystem:
 
                     # Base64 encode the chunk
                     b64_audio = base64.b64encode(data).decode("utf-8")
-                    # Append to the model’s input audio buffer
+                    # Append to the model's input audio buffer
                     await self.realtime_conn.input_audio_buffer.append(audio=b64_audio)
 
                 await asyncio.sleep(0)
@@ -254,9 +280,11 @@ class DialogueSystem:
             stream.close()
 
     async def commit_and_get_assistant_response(self):
-        if self.realtime_conn:
+        if self.realtime_conn and self.current_npc:
             await self.realtime_conn.input_audio_buffer.commit()
-            await self.realtime_conn.response.create()
+            # Use the appropriate voice for the current NPC
+            voice = self.voice_settings[self.current_npc]["voice"]
+            await self.realtime_conn.response.create(voice=voice)
             print("[DialogueSystem] Committed user audio & requested assistant response.")
             self.sent_audio_once = False  # reset
 
@@ -264,12 +292,9 @@ class DialogueSystem:
         asyncio.set_event_loop(self.loop)
         self.loop.run_forever()
 
-
-
     def start_conversation(self, npc_role="HR", player_pos=None):
         """
         Called when the dialogue starts (e.g. player pressed 'E' to talk).
-        You can decide to automatically do push-to-talk here, or wait.
         """
         self.active = True
         self.input_active = True
@@ -277,26 +302,11 @@ class DialogueSystem:
         self.initial_player_pos = [player_pos[0], player_pos[1], player_pos[2]] if player_pos else [0, 0.5, 0]
         print(f"[DialogueSystem] Dialogue started with {npc_role}")
 
-        # Base personality framework for consistent behavior
-        base_prompt = """Interaction Framework:
-            - Maintain consistent personality throughout conversation
-            - Remember previous context within the dialogue
-            - Use natural speech patterns with occasional filler words
-            - Show emotional intelligence in responses
-            - Keep responses concise but meaningful (2-3 sentences)
-            - React appropriately to both positive and negative interactions
-            """
-
-        if npc_role == "HR":
-            system_prompt = f"""{base_prompt}
-                You are Sarah Chen, HR Director at Venture Builder AI. Core traits:
-                (HR details here)...
-            """
-        else:  # CEO
-            system_prompt = f"""{base_prompt}
-                You are Michael Chen, CEO of Venture Builder AI. Core traits:
-                (CEO details here)...
-            """
+        # Get the appropriate voice settings for this NPC
+        voice_settings = self.voice_settings.get(npc_role, {
+            "voice": "alloy",
+            "system_prompt": "You are a helpful assistant."
+        })
 
         initial_message = {
             "HR": "Hello! I'm Sarah, the HR Director at Venture Builder AI. How can I assist you today?",
@@ -307,14 +317,13 @@ class DialogueSystem:
 
         self.conversation_history = [{
             "role": "system",
-            "content": system_prompt
+            "content": voice_settings["system_prompt"]
         }]
 
     def send_message(self):
         """
         If you still want typed-based conversation, you can keep using
-        the normal Chat Completions API call. But note that the Realtime
-        session is also able to produce text transcripts on its own.
+        the normal Chat Completions API call.
         """
         if not self.conversation_history:
             print("[DialogueSystem] No conversation history to send.")
@@ -323,7 +332,6 @@ class DialogueSystem:
         try:
             response = client.chat.completions.create(
                 model="gpt-4-0125-preview",
-                # model="gpt-3.5-turbo",
                 messages=self.conversation_history,
                 temperature=0.85,
                 max_tokens=150,
@@ -411,7 +419,7 @@ class DialogueSystem:
                 print("[DialogueSystem] Chat ended")
                 return {"command": "move_player_back", "position": self.initial_player_pos}
 
-            # If user wants to push-to-talk with "K"
+            # If user wants to push-to-talk with F5
             if event.key == pygame.K_F5:
                 # Toggle
                 if self.should_send_audio.is_set():
