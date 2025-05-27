@@ -4,7 +4,7 @@ An interactive 3D office environment built with Python, PyGame, and OpenGL, feat
 
 ## Prerequisites
 
-- Python 3.8+
+- Python 3.11
 - OpenGL support
 - PyGame
 
